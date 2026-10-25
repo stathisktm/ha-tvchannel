@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "TV Channel Watcher",
+        "description": "Watches which live-TV channel is currently tuned. Two modes — pick whichever this TV's firmware actually supports (some TCL firmware exposes neither the channel name nor the channel database any other way): 'Settings key' gently polls one system setting; 'Live log stream' keeps a permanent connection open and catches the channel name the instant it's logged, for firmware that doesn't have that setting at all. Either way, only the raw value is exposed — turning it into a nicer name is done with your own template sensor, grown at your own pace.",
+        "data": {
+          "media_player_entity_id": "TV (media_player entity)",
+          "mode": "Mode",
+          "scan_interval": "Poll interval (Settings key mode only)",
+          "host": "TV IP address (Live log stream mode only)",
+          "port": "ADB port (Live log stream mode only)"
+        },
+        "data_description": {
+          "media_player_entity_id": "The same adb-capable media_player entity already used for adb commands on this TV.",
+          "mode": "Settings key: polls a system setting (works on some TCL firmware). Live log stream: keeps a permanent connection open and reads the channel name from the TV's own log the instant it changes (for firmware with no such setting).",
+          "scan_interval": "Seconds between checks. Lower is faster to notice a channel change; higher is gentler on the TV. A single check is a tiny, near-instant shell command either way. Ignored in Live log stream mode.",
+          "host": "The TV's IP address on your network, e.g. 192.168.1.50 — needed because this mode opens its own direct connection to the TV instead of going through the existing Android TV integration.",
+          "port": "The TV's ADB port. Almost always 5555, the same one already used to control it."
+        }
+      }
+    },
+    "error": {
+      "host_required_for_logcat_stream": "TV IP address is required for Live log stream mode."
+    },
+    "abort": {
+      "already_configured": "This TV is already being watched."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "TV Channel Watcher settings",
+        "data": {
+          "media_player_entity_id": "TV (media_player entity)",
+          "mode": "Mode",
+          "scan_interval": "Poll interval (Settings key mode only)",
+          "host": "TV IP address (Live log stream mode only)",
+          "port": "ADB port (Live log stream mode only)"
+        }
+      }
+    }
+  },
+  "selector": {
+    "mode": {
+      "options": {
+        "settings_key": "Settings key (polling)",
+        "logcat_stream": "Live log stream (permanent connection)"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "channel_id": {
+        "name": "Channel ID"
+      },
+      "channel_name": {
+        "name": "Channel name"
+      },
+      "current_program": {
+        "name": "Current program"
+      }
+    }
+  }
+}
