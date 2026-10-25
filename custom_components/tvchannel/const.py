@@ -81,3 +81,7 @@ CURRENT_PROGRAM_PATTERN = (
 # How long to wait before retrying the persistent connection after it drops (TV reboot, network
 # blip, Wi-Fi roam, ...) — not instant, so a flaky link doesn't spin in a tight reconnect loop.
 RECONNECT_DELAY_S = 15
+
+# How often MODE_LOGCAT_STREAM also reads recent_play_channel_id (on TVs that keep it) to stay
+# right when the log cannot help: after an HA restart or the TV waking from standby.
+CHANNEL_ID_POLL_S = 60

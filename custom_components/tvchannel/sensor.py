@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import timedelta
 import logging
 import re
 
@@ -15,6 +16,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -33,6 +37,7 @@ from .const import (
     DOMAIN,
     LOGCAT_COMMAND,
     MODE_LOGCAT_STREAM,
+    CHANNEL_ID_POLL_S,
     PROGRAM_NAME_PATTERN,
     RECONNECT_DELAY_S,
 )
@@ -114,7 +119,7 @@ class TvChannelIdSensor(CoordinatorEntity[TvChannelCoordinator], SensorEntity):
         }
 
 
-class TvChannelLogcatSensor(SensorEntity):
+class TvChannelLogcatSensor(SensorEntity, RestoreEntity):
     """MODE_LOGCAT_STREAM — raw channel NAME (not an id — there's no id to have here), pushed live
     from a continuously open `logcat` stream over its own direct ADB TCP connection, instead of
     polled. See the package docstring for why a poll can't work for this particular firmware.
@@ -140,15 +145,85 @@ class TvChannelLogcatSensor(SensorEntity):
         self._attr_native_value: str | None = None
         self._task: asyncio.Task | None = None
         self._program_sensor: TvChannelProgramSensor | None = None
+        self._media_player: str = get_config(entry, CONF_MEDIA_PLAYER)
+        # The log only names the channel at the moment it changes, so on its own this lost the
+        # channel after every HA restart (and after the TV came back from standby) until the next
+        # change. Two fixes: the last value is restored across restarts, and on TVs whose firmware
+        # keeps `recent_play_channel_id` the current id is read once a minute (one tiny `settings
+        # get`, nothing on screen) and turned into a name through an id -> name map this sensor
+        # learns by itself, every time the log names a channel.
+        self._channel_id: str | None = None
+        self._id_names: dict[str, str] = {}
+        self._id_supported: bool | None = None  # None = not probed yet
+        self._store: Store[dict[str, str]] | None = None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        return {"channel_id": self._channel_id}
 
     def attach_program_sensor(self, program_sensor: "TvChannelProgramSensor") -> None:
         """Optional sibling entity fed from this one's own read loop — see async_setup_entry."""
         self._program_sensor = program_sensor
 
     async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state not in ("unknown", "unavailable"):
+            self._attr_native_value = last.state
+            self._channel_id = last.attributes.get("channel_id")
+        self._store = Store(self.hass, 1, f"tvchannel.{self._entry.entry_id}.channel_ids")
+        self._id_names = await self._store.async_load() or {}
         self._task = self.hass.async_create_background_task(
             self._run(), name=f"tvchannel_logcat_{self._entry.entry_id}",
         )
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_poll_channel_id, timedelta(seconds=CHANNEL_ID_POLL_S))
+        )
+
+    async def _async_read_channel_id(self) -> str | None:
+        """`settings get system recent_play_channel_id` through the androidtv integration's own
+        connection. None if unreadable; the setting missing altogether ("null") switches polling
+        off for this TV, whose firmware simply does not keep it."""
+        try:
+            await self.hass.services.async_call(
+                "androidtv", "adb_command", {"entity_id": self._media_player, "command": ADB_COMMAND}, blocking=True,
+            )
+        except Exception:  # noqa: BLE001 - TV off / adb busy: just try again next time
+            return None
+        state = self.hass.states.get(self._media_player)
+        response = ((state.attributes.get("adb_response") if state else None) or "").strip()
+        if response.isdigit():
+            self._id_supported = True
+            return response
+        if response == "null":
+            self._id_supported = False
+        return None
+
+    async def _async_poll_channel_id(self, _now=None) -> None:
+        if self._id_supported is False or not self._attr_available:
+            return
+        channel_id = await self._async_read_channel_id()
+        if channel_id is None or channel_id == self._channel_id:
+            return
+        self._channel_id = channel_id
+        name = self._id_names.get(channel_id)
+        if name and name != self._attr_native_value:
+            _LOGGER.debug("tvchannel: channel id %s -> %s (from poll)", channel_id, name)
+            self._attr_native_value = name
+        self.async_write_ha_state()
+
+    async def _async_learn_id_for(self, name: str) -> None:
+        """Right after the log names a channel, read the id it now has and remember the pair."""
+        if self._id_supported is False:
+            return
+        channel_id = await self._async_read_channel_id()
+        if channel_id is None or self._attr_native_value != name:
+            return
+        self._channel_id = channel_id
+        if self._id_names.get(channel_id) != name:
+            self._id_names[channel_id] = name
+            await self._store.async_save(self._id_names)
+        self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
         if self._task is not None:
@@ -196,6 +271,8 @@ class TvChannelLogcatSensor(SensorEntity):
                 if not self._attr_available:
                     self._attr_available = True
                     self.async_write_ha_state()
+                    # Back from a restart or standby: ask which channel is on right away.
+                    self.hass.async_create_task(self._async_poll_channel_id())
                 # transport_timeout_s must be set here too, not just read_timeout_s — it's the
                 # actual per-read socket timeout (read_timeout_s is only an overall retry budget
                 # on top of it). Left unset, it falls back to the connection's own
@@ -219,6 +296,12 @@ class TvChannelLogcatSensor(SensorEntity):
                             if name and name != self._attr_native_value:
                                 self._attr_native_value = name
                                 self.async_write_ha_state()
+                            if name:
+                                # The setting updates a moment after the tune is logged.
+                                async_call_later(
+                                    self.hass, 2,
+                                    lambda _t, n=name: self.hass.async_create_task(self._async_learn_id_for(n)),
+                                )
                         # Independent of the channel-name match above — a line can only ever match
                         # one of the two patterns, so this never interferes with it either way.
                         if self._program_sensor is not None:
